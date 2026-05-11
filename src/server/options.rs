@@ -193,6 +193,55 @@ pub(crate) fn render_window_options(app: &AppState) -> String {
     output
 }
 
+/// Returns `true` if the given option name is a boolean (on/off) option.
+/// Used by set-option toggle logic (tmux parity: `set <option>` without a
+/// value toggles boolean options).
+pub(crate) fn is_boolean_option(name: &str) -> bool {
+    matches!(
+        name,
+        "mouse"
+            | "scroll-enter-copy-mode"
+            | "pwsh-mouse-selection"
+            | "mouse-selection"
+            | "paste-detection"
+            | "choose-tree-preview"
+            | "focus-events"
+            | "renumber-windows"
+            | "automatic-rename"
+            | "allow-rename"
+            | "allow-set-title"
+            | "monitor-activity"
+            | "visual-activity"
+            | "synchronize-panes"
+            | "remain-on-exit"
+            | "destroy-unattached"
+            | "exit-empty"
+            | "set-titles"
+            | "aggressive-resize"
+            | "visual-bell"
+            | "prediction-dimming"
+            | "allow-predictions"
+            | "cursor-blink"
+            | "warm"
+            | "alternate-screen"
+            | "claude-code-fix-tty"
+            | "claude-code-force-interactive"
+            | "status"
+    )
+}
+
+/// Toggle a boolean option: read current value and flip it.
+/// Returns `true` if the option was toggled, `false` if not a boolean option.
+pub(crate) fn toggle_option(app: &mut AppState, option: &str) -> bool {
+    if !is_boolean_option(option) {
+        return false;
+    }
+    let current = get_option_value(app, option);
+    let new_value = if current == "on" { "off" } else { "on" };
+    apply_set_option(app, option, new_value, false);
+    true
+}
+
 /// Apply a set-option command. If `quiet` is true, unknown options are silently ignored.
 pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _quiet: bool) {
     match option {
@@ -489,3 +538,7 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue266_per_window_autorename.rs"]
 mod tests_issue266_per_window_autorename;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue278_toggle_bool_option.rs"]
+mod tests_issue278_toggle_bool_option;

@@ -470,6 +470,15 @@ fn parse_set_option(app: &mut AppState, line: &str) {
         return;
     }
 
+    // No value provided: toggle boolean options (tmux parity #278)
+    if raw_value.is_empty() && !unset_mode && !append_mode {
+        if crate::server::options::is_boolean_option(key) {
+            crate::server::options::toggle_option(app, key);
+            app.user_set_options.insert(key.to_string());
+            return;
+        }
+    }
+
     // Handle -o (only set if not currently set)
     if only_if_unset {
         // For @-prefixed user options, check if key exists
