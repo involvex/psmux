@@ -2343,6 +2343,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                     app.session_name = name;
+                    // Warm server's created_at is the warm process start time, not the
+                    // user's session-creation time — reset on claim or list-sessions /
+                    // session_created / uptime would report the warm pool's age.
+                    app.created_at = chrono::Local::now();
                     // Update env so run-shell/hooks from this server target the new name
                     env::set_var("PSMUX_TARGET_SESSION", app.port_file_base());
                     // Honour the client's working directory: the warm server
