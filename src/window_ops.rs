@@ -226,6 +226,25 @@ pub(crate) fn pane_wants_mouse(pane: &Pane) -> bool {
     is_fullscreen_tui(pane)
 }
 
+/// Strict check for hover/motion events.  Returns true only when the child
+/// has EXPLICITLY enabled mouse motion tracking (DECSET 1002 ButtonMotion or
+/// DECSET 1003 AnyMotion).
+///
+/// Unlike `pane_wants_mouse()`, this does NOT use alt-screen or fullscreen
+/// heuristics.  Sending unsolicited SGR motion sequences to apps that haven't
+/// enabled mouse tracking (e.g. nvim without `set mouse=a`, or any TUI app
+/// that only uses alt-screen for rendering) corrupts their input and makes
+/// them appear hung.  (fixes #296)
+pub(crate) fn pane_wants_hover(pane: &Pane) -> bool {
+    if let Ok(parser) = pane.term.lock() {
+        let screen = parser.screen();
+        matches!(screen.mouse_protocol_mode(),
+            vt100::MouseProtocolMode::ButtonMotion | vt100::MouseProtocolMode::AnyMotion)
+    } else {
+        false
+    }
+}
+
 /// Detect whether a pane has a VT bridge descendant (wsl.exe, ssh.exe, etc.)
 /// by walking the process tree.  Result is cached for 2 seconds per pane
 /// to avoid expensive CreateToolhelp32Snapshot on every mouse event.

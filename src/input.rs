@@ -2373,7 +2373,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                 let wants_mouse = {
                     let win2 = &app.windows[app.active_idx];
                     active_pane(&win2.root, &win2.active_path)
-                        .map_or(false, |p| crate::window_ops::pane_wants_mouse(p))
+                        .map_or(false, |p| crate::window_ops::pane_wants_hover(p))
                 };
                 if wants_mouse {
                     if let Some(area) = active_area {
@@ -2399,9 +2399,13 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
             }
         }
         MouseEventKind::Moved => {
-            // Forward bare mouse motion (hover) only when active pane
-            // explicitly wants mouse input. This avoids sending raw
-            // SGR motion bytes (ESC[<35;...) to shell-like prompts.
+            // Forward bare mouse motion (hover) only when the child has
+            // EXPLICITLY enabled mouse motion tracking (DECSET 1002/1003).
+            // Do NOT use the permissive pane_wants_mouse() heuristic here:
+            // sending unsolicited SGR motion sequences to alt-screen apps
+            // that haven't enabled mouse tracking (nvim without mouse=a,
+            // any TUI spawning a child editor) corrupts their input.
+            // (fixes #296: Claude Code → nvim hangs due to hover flooding)
             if app.last_hover_pos == Some((me.column, me.row)) {
                 return Ok(());
             }
@@ -2409,7 +2413,7 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
 
             if let Some(area) = active_area {
                 if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                    if crate::window_ops::pane_wants_mouse(active) {
+                    if crate::window_ops::pane_wants_hover(active) {
                         forward_mouse_to_pane_ex(active, area, me.column, me.row,
                             0, crate::platform::mouse_inject::MOUSE_MOVED,
                             35, true);
