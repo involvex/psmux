@@ -253,6 +253,12 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     (true, data)
                         if data.iter().all(|c| BASE64.contains(c)) =>
                     {
+                        // Stage the payload on Screen so the psmux server
+                        // can drain it and forward an OSC 52 to the host
+                        // terminal.  Unblocks tools like Claude Code's
+                        // `/copy` running inside a pane (OSC 52 was being
+                        // swallowed by the default no-op callbacks).
+                        self.screen.set_clipboard(ty, data);
                         self.callbacks.copy_to_clipboard(
                             &mut self.screen,
                             ty,

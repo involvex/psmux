@@ -124,6 +124,16 @@ pub struct Screen {
     /// stays `Some` after that so a clear (state=0) is also forwarded.
     osc94_progress: Option<(u8, u8)>,
 
+    /// Pending OSC 52 clipboard payload emitted by the child process inside
+    /// this pane.  Format: `Some((selector_bytes, base64_payload))`.  The
+    /// selector is the raw selector field from the OSC (e.g. `b"c"`,
+    /// `b"p"`, etc., or empty) and `base64_payload` is the still-encoded
+    /// data string.  Consumed once via [`Screen::take_clipboard`]; the
+    /// psmux server drains this and stages it onto `App.clipboard_osc52`
+    /// so the client re-emits OSC 52 on its own stdout to reach the host
+    /// terminal (Windows Terminal, etc.).
+    osc52_clipboard: Option<(Vec<u8>, Vec<u8>)>,
+
     /// Set to `true` when the screen is cleared (CSI 2J) while
     /// `squelch_clear_pending` is active.  The layout serialiser
     /// checks this flag to know that `cls` has finished.
@@ -175,6 +185,7 @@ impl Screen {
             osc_title: String::new(),
             osc7_path: None,
             osc94_progress: None,
+            osc52_clipboard: None,
             squelch_cleared: false,
             squelch_clear_pending: false,
             audible_bell_count: 0,
@@ -774,6 +785,33 @@ impl Screen {
         let s = state.min(4);
         let v = value.min(100);
         self.osc94_progress = Some((s, v));
+    }
+
+    /// Store an OSC 52 clipboard copy request emitted by the child.
+    /// `selector` is the raw selector field (e.g. `b"c"`), `data` is the
+    /// base64-encoded payload exactly as received.  Later writes overwrite
+    /// earlier ones until [`Screen::take_clipboard`] consumes the slot.
+    pub fn set_clipboard(&mut self, selector: &[u8], data: &[u8]) {
+        self.osc52_clipboard = Some((selector.to_vec(), data.to_vec()));
+    }
+
+    /// Returns and clears any pending OSC 52 clipboard payload.  Consume-once:
+    /// after a successful drain this returns `None` until the next OSC 52
+    /// arrives.  Used by the psmux server to forward child-emitted clipboard
+    /// requests onto `App.clipboard_osc52`, which the client re-emits as an
+    /// OSC 52 sequence on its own stdout so the host terminal (Windows
+    /// Terminal, etc.) can perform the actual copy.
+    pub fn take_clipboard(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.osc52_clipboard.take()
+    }
+
+    /// Peek at the pending OSC 52 clipboard payload without consuming it.
+    /// Returns `None` if no copy request is currently staged.
+    #[must_use]
+    pub fn clipboard(&self) -> Option<(&[u8], &[u8])> {
+        self.osc52_clipboard
+            .as_ref()
+            .map(|(s, d)| (s.as_slice(), d.as_slice()))
     }
 
     /// Returns `true` if a screen clear (CSI 2J) was detected while

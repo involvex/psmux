@@ -287,6 +287,41 @@ pub(crate) fn active_pane_progress(app: &AppState) -> Option<(u8, u8)> {
     parser.screen().progress()
 }
 
+/// Drain a pending OSC 52 clipboard payload from any pane in the tree.
+/// Returns the first `(selector, base64_data)` found and clears it on the
+/// source pane.  Lets a child process inside any pane (e.g. Claude Code's
+/// `/copy`) ask the host terminal to copy text — the dump-state builder
+/// stages the result onto `App.clipboard_osc52`, the client re-emits OSC
+/// 52 on its own stdout, and the host terminal performs the copy.
+pub(crate) fn take_pane_clipboard(app: &AppState) -> Option<(Vec<u8>, Vec<u8>)> {
+    for win in &app.windows {
+        if let Some(payload) = drain_clipboard_in_node(&win.root) {
+            return Some(payload);
+        }
+    }
+    None
+}
+
+fn drain_clipboard_in_node(node: &Node) -> Option<(Vec<u8>, Vec<u8>)> {
+    match node {
+        Node::Leaf(p) => {
+            if p.dead {
+                return None;
+            }
+            let mut parser = p.term.lock().ok()?;
+            parser.screen_mut().take_clipboard()
+        }
+        Node::Split { children, .. } => {
+            for c in children {
+                if let Some(r) = drain_clipboard_in_node(c) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+    }
+}
+
 fn propagate_osc_titles_in_tree(node: &mut Node, dirty: &mut bool) {
     match node {
         Node::Leaf(p) => {
