@@ -1312,88 +1312,64 @@ pub fn shutdown_client_stream(client_id: u64) {
             }
         });
     }
-    if let Ok(mut v) = FRAME_PUSH_CHANNELS.lock() {
+    if let Ok(mut v) = FRAME_PUSH_SLOTS.lock() {
         v.retain(|(cid, _)| *cid != client_id);
     }
     remove_directive_channel(client_id);
 }
 
-/// Server-push frame channels for persistent (attached) clients.
-/// Uses a bounded `sync_channel` with a small capacity to allow short bursts
-/// of frames to queue without dropping, while still bounding memory.
+/// Server-push frame slot for persistent (attached) clients.
 ///
-/// When the channel is full (sustained high-throughput, e.g. rapid scroll in
-/// copy mode), the oldest unconsumed frame is drained before pushing the new
-/// one, so the client always receives the latest frame without unbounded
-/// memory growth.
+/// Each slot holds at most one pending frame. `push_frame()` overwrites any
+/// unconsumed frame; frames are full snapshots, so a stale ready frame has
+/// no value once a newer one exists. Memory is bounded to O(clients), not
+/// O(frames).
 ///
-/// Previous single-slot design (694156e) overwrote unconsumed frames, which
-/// fixed a memory leak during copy-mode scrolling but dropped intermediate
-/// frames during fast typing — the cursor advanced but characters were not
-/// rendered.  A bounded channel preserves intermediate frames under normal
-/// typing speeds while still capping memory for pathological scroll bursts.
-const FRAME_CHANNEL_CAPACITY: usize = 16;
+/// The slot uses `Mutex<Option<String>>`. The producer (main loop's
+/// `push_frame`) locks, replaces, unlocks. The consumer (writer thread)
+/// locks, takes, unlocks, then writes to TCP *outside* the lock. Neither
+/// side ever holds the lock across blocking I/O, so a slow client cannot
+/// stall the main event loop.
+///
+/// Design constraints:
+///   - The lock must not be held across blocking I/O. The writer thread
+///     does TCP writes that can block (slow client, full kernel buffer).
+///     A design where the writer holds a lock during the write -- and the
+///     producer also takes that lock to enqueue -- lets a slow client
+///     stall the server main loop.
+///   - Per-client storage must be bounded. An unbounded queue (e.g. plain
+///     `mpsc::channel`) leaks memory under sustained producer-faster-than-
+///     consumer load (rapid copy-mode scroll).
+///   - `std::sync::atomic` has no atomic-swap for owned heap values;
+///     `AtomicPtr<String>` would require `unsafe` ownership management.
+///     `arc-swap` would be lock-free but adds a third-party dependency
+///     for a path that is not measured-hot.
+pub type FrameSlot = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 
-pub type FrameChannel = std::sync::Arc<FrameChannelInner>;
-
-pub struct FrameChannelInner {
-    pub tx: std::sync::mpsc::SyncSender<String>,
-    pub rx: std::sync::Mutex<std::sync::mpsc::Receiver<String>>,
-}
-
-static FRAME_PUSH_CHANNELS: std::sync::Mutex<Vec<(u64, FrameChannel)>> =
+static FRAME_PUSH_SLOTS: std::sync::Mutex<Vec<(u64, FrameSlot)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Register a bounded frame channel for a persistent connection's writer
-/// thread, tagged with client_id for targeted operations (e.g. force-detach).
-/// Returns the channel Arc for the writer thread to consume from.
-pub fn register_frame_channel(client_id: u64) -> FrameChannel {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(FRAME_CHANNEL_CAPACITY);
-    let channel = std::sync::Arc::new(FrameChannelInner {
-        tx,
-        rx: std::sync::Mutex::new(rx),
-    });
-    if let Ok(mut v) = FRAME_PUSH_CHANNELS.lock() {
-        v.push((client_id, channel.clone()));
+/// Register a frame slot for a persistent connection's writer thread.
+/// Returns the slot Arc for the writer thread to consume from.
+pub fn register_frame_channel(client_id: u64) -> FrameSlot {
+    let slot: FrameSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    if let Ok(mut v) = FRAME_PUSH_SLOTS.lock() {
+        v.push((client_id, slot.clone()));
     }
-    channel
+    slot
 }
 
 /// Push a serialized frame to all persistent clients.
-/// If a client's channel is full, drain the oldest frame first so the
-/// newest frame is always delivered — this bounds memory while ensuring
-/// the client never stalls the server.
-/// Dead channels (writer thread exited) are pruned automatically.
+/// Overwrites any unconsumed frame; frames are full snapshots, so only
+/// the latest matters. The lock is held only for the duration of an
+/// Option::replace, never across I/O.
+/// Dead slots (poisoned mutex) are pruned automatically.
 pub fn push_frame(frame: &str) {
-    if let Ok(mut channels) = FRAME_PUSH_CHANNELS.lock() {
-        channels.retain(|(_, channel)| {
-            match channel.tx.try_send(frame.to_string()) {
-                Ok(()) => true,
-                Err(std::sync::mpsc::TrySendError::Full(frame)) => {
-                    // Frames are full snapshots, not deltas. If the client is
-                    // behind, stale queued frames should not block the newest
-                    // corrective frame from reaching the terminal.
-                    //
-                    // Use try_lock, not lock: the writer thread holds rx.lock()
-                    // while it drains into its local buffer (before TCP writes).
-                    // Blocking here would deadlock the server's main loop.
-                    // If try_lock fails the writer is mid-drain; skip our drain
-                    // and try_send anyway — the writer will free space shortly.
-                    if let Ok(rx) = channel.rx.try_lock() {
-                        loop {
-                            match rx.try_recv() {
-                                Ok(_) => {}
-                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                                Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
-                            }
-                        }
-                    }
-                    matches!(
-                        channel.tx.try_send(frame),
-                        Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_))
-                    )
-                }
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+    if let Ok(mut slots) = FRAME_PUSH_SLOTS.lock() {
+        slots.retain(|(_, slot)| {
+            match slot.lock() {
+                Ok(mut s) => { *s = Some(frame.to_string()); true }
+                Err(_) => false, // writer thread panicked; prune
             }
         });
     }
@@ -1401,14 +1377,14 @@ pub fn push_frame(frame: &str) {
 
 /// Check if any persistent clients are registered for push.
 pub fn has_frame_receivers() -> bool {
-    FRAME_PUSH_CHANNELS.lock().map_or(false, |v| !v.is_empty())
+    FRAME_PUSH_SLOTS.lock().map_or(false, |v| !v.is_empty())
 }
 
-/// Remove the frame channel for a specific client. Called by the writer thread
-/// on exit so the server stops pushing to dead channels and has_frame_receivers()
+/// Remove the frame slot for a specific client. Called by the writer thread
+/// on exit so the server stops pushing to dead slots and has_frame_receivers()
 /// returns false when no live clients remain.
 pub fn deregister_frame_channel(client_id: u64) {
-    if let Ok(mut v) = FRAME_PUSH_CHANNELS.lock() {
+    if let Ok(mut v) = FRAME_PUSH_SLOTS.lock() {
         v.retain(|(cid, _)| *cid != client_id);
     }
 }

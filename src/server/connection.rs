@@ -259,16 +259,14 @@ if line.trim() == "PERSISTENT" {
     let _ = ws_bg.set_write_timeout(Some(Duration::from_secs(5)));
     let (resp_tx, resp_rx) = mpsc::channel::<mpsc::Receiver<String>>();
 
-    // Register a bounded frame channel for server-pushed frames (event-driven
-    // rendering).  The channel queues up to FRAME_CHANNEL_CAPACITY frames,
-    // allowing short bursts (e.g. fast typing) to be delivered without dropping
-    // intermediate states, while still bounding memory for sustained throughput
-    // scenarios (e.g. rapid scroll in copy mode).
-    let frame_chan = crate::types::register_frame_channel(client_id);
+    // Register a frame slot for server-pushed frames (event-driven rendering).
+    // Slot holds at most one pending frame; push_frame() overwrites any
+    // unconsumed frame because only the latest snapshot is worth rendering.
+    let frame_slot = crate::types::register_frame_channel(client_id);
 
     // Register a directive channel for queued directives (e.g. SWITCH).
     // Directives use a separate mpsc channel so they are never affected
-    // by frame channel backpressure.
+    // by frame slot contention.
     let directive_rx = crate::types::register_directive_channel(client_id);
 
     // Clone the write socket so the Guard can shut down the connection when
@@ -301,12 +299,17 @@ if line.trim() == "PERSISTENT" {
         let _guard = Guard { client_id, shutdown: ws_shutdown };
 
         loop {
-            // 0. Check for queued directives (non-blocking) — these take priority
+            // Each iteration drains all three sources in priority order
+            // (directives, command responses, frame slot). The frame slot
+            // is always checked, so command-response activity cannot
+            // starve frame delivery.
+
+            // 0. Drain queued directives (non-blocking).
             while let Ok(directive) = directive_rx.try_recv() {
                 if write!(ws_bg, "{}\n", directive).is_err() { return; }
                 if ws_bg.flush().is_err() { return; }
             }
-            // 1. Drain all pending command responses (non-blocking after first)
+            // 1. Drain pending command responses.
             match resp_rx.recv_timeout(Duration::from_millis(5)) {
                 Ok(rrx) => {
                     // Use a timeout matching the TCP write timeout (5 s) so the
@@ -331,26 +334,13 @@ if line.trim() == "PERSISTENT" {
                             Err(_) => return,
                         }
                     }
-                    continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            // 2. Drain all queued frames from the bounded channel.
-            // Drain into a local buffer while holding rx.lock(), then drop
-            // the lock before writing to TCP. Holding rx.lock() across a
-            // blocking flush would deadlock push_frame() on the server loop.
-            let mut pending_frames: Vec<String> = Vec::new();
-            match frame_chan.rx.lock() {
-                Ok(frame_rx) => {
-                    while let Ok(text) = frame_rx.try_recv() {
-                        pending_frames.push(text);
-                    }
-                }
-                Err(_) => return,
-            }
-            // rx.lock released here — TCP writes happen with no lock held
-            for text in &pending_frames {
+            // 2. Take the latest pushed frame from the slot.
+            let frame = frame_slot.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(text) = frame {
                 if write!(ws_bg, "{}\n", text).is_err() { return; }
                 if ws_bg.flush().is_err() { return; }
             }

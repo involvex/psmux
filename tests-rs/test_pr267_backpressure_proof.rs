@@ -1,62 +1,74 @@
 use super::*;
 
 /// Serialize backpressure tests: push_frame broadcasts to ALL registered
-/// channels globally, so concurrent tests cross-contaminate each other.
+/// slots globally, so concurrent tests cross-contaminate each other.
 static BP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Proof that push_frame now delivers the newest frame when the channel is full.
-/// Previously (before PR #267 fix), the newest frame was silently dropped.
+/// Burst large enough that any naive "first wins" or unbounded-buffer
+/// implementation would be observable. The swap-chain slot has effective
+/// capacity 1, so any value > 1 is sufficient; 20 makes intent obvious.
+const BURST_SIZE: usize = 20;
+
+/// Proof that push_frame delivers the newest frame after a burst of pushes
+/// without an intervening read. The swap-chain slot (Arc<Mutex<Option<String>>>)
+/// holds at most one pending frame; later pushes overwrite earlier ones.
+///
+/// History: PR #267 introduced a bounded sync_channel(16) with drain-on-Full
+/// to preserve the "newest wins" property. That fix held a Mutex<Receiver>
+/// across blocking TCP writes, causing the freeze this branch replaces with
+/// a single-slot swap chain.
 #[test]
-fn push_frame_drops_newest_when_channel_full() {
+fn push_frame_slot_holds_only_newest_after_burst() {
     let _guard = BP_TEST_LOCK.lock().unwrap();
     let client_id = u64::MAX - 9990;
     // Clean up any prior registration
     shutdown_client_stream(client_id);
 
-    let channel = register_frame_channel(client_id);
+    let slot = register_frame_channel(client_id);
 
-    // Fill channel to capacity with stale frames
-    for idx in 0..FRAME_CHANNEL_CAPACITY {
+    // Push a burst of stale frames, then the one we care about.
+    assert!(BURST_SIZE > 1, "precondition: burst must exceed slot capacity (1)");
+    for idx in 0..BURST_SIZE {
         push_frame(&format!("stale-{idx}"));
     }
-
-    // Now push a new frame while channel is full
     push_frame("NEWEST_CRITICAL_FRAME");
 
-    // Drain everything from the channel
-    let rx = channel.rx.lock().expect("frame receiver lock");
-    let mut frames = Vec::new();
-    while let Ok(frame) = rx.try_recv() {
-        frames.push(frame);
-    }
-    drop(rx);
+    // Take the slot's content, then verify the slot is now empty.
+    let first = slot.lock().expect("frame slot lock").take();
+    let second = slot.lock().expect("frame slot lock").take();
     shutdown_client_stream(client_id);
 
-    // After the fix, the stale frames should be drained and
-    // ONLY the newest frame should be in the queue.
-    assert_eq!(frames, vec!["NEWEST_CRITICAL_FRAME".to_string()],
-        "Expected only the newest frame after backpressure drain");
+    assert_eq!(
+        first.as_deref(),
+        Some("NEWEST_CRITICAL_FRAME"),
+        "expected only the newest frame in the swap-chain slot",
+    );
+    assert!(
+        second.is_none(),
+        "slot should hold at most one frame; second take must be empty",
+    );
 }
 
-/// PR #267's original test: saturated frame queue delivers latest snapshot.
+/// PR #267's original intent: saturated frame queue delivers latest snapshot.
+/// With the swap-chain replacement, "saturation" is implicit (capacity = 1)
+/// and the assertion collapses to "only the latest push survives a burst".
 #[test]
-fn push_frame_replaces_stale_backlog_when_full() {
+fn push_frame_replaces_stale_backlog() {
     let _guard = BP_TEST_LOCK.lock().unwrap();
     let client_id = u64::MAX - 246;
     shutdown_client_stream(client_id);
 
-    let channel = register_frame_channel(client_id);
-    for idx in 0..FRAME_CHANNEL_CAPACITY {
+    let slot = register_frame_channel(client_id);
+    assert!(BURST_SIZE > 1, "precondition: burst must exceed slot capacity (1)");
+    for idx in 0..BURST_SIZE {
         push_frame(&format!("stale-{idx}"));
     }
     push_frame("newest");
 
-    let rx = channel.rx.lock().expect("frame receiver lock");
-    let mut frames = Vec::new();
-    while let Ok(frame) = rx.try_recv() {
-        frames.push(frame);
-    }
-
+    let first = slot.lock().expect("frame slot lock").take();
+    let second = slot.lock().expect("frame slot lock").take();
     shutdown_client_stream(client_id);
-    assert_eq!(frames, vec!["newest".to_string()]);
+
+    assert_eq!(first.as_deref(), Some("newest"));
+    assert!(second.is_none(), "slot should hold at most one frame");
 }
