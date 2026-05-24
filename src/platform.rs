@@ -1946,12 +1946,28 @@ pub mod process_info {
         )
     }
 
+    /// Known shell/wrapper executables where the meaningful foreground
+    /// command is one level deeper (e.g. `cmd /c foo`, `bash -c foo`,
+    /// `npx tool`).  When the immediate child is one of these, we look
+    /// at *its* immediate child instead.
+    fn is_wrapper_exe(name: &str) -> bool {
+        let stem = name.strip_suffix(".exe").unwrap_or(name);
+        matches!(stem,
+            "cmd" | "bash" | "sh" | "dash" | "zsh" | "fish"
+            | "npx" | "npm" | "pnpm" | "yarn" | "bunx"
+            | "env" | "sudo" | "runas"
+        )
+    }
+
     /// Walk the process tree from `root_pid` downward and return the PID of
     /// the process most likely to be the user's foreground command.
     ///
-    /// Strategy: BFS all descendants, then pick the deepest non-system leaf.
-    /// When multiple candidates exist at the same depth, prefer the largest
-    /// PID (heuristic for "most recently created").
+    /// Strategy: pick the immediate non-system child of `root_pid`.  This
+    /// matches tmux's effective behaviour (`tcgetpgrp` returns the process
+    /// that took TTY foreground, which is the program the user launched from
+    /// the shell).  For known wrapper processes (cmd, bash, npx, ...) we
+    /// look one level deeper so the meaningful program is returned instead
+    /// of the wrapper.
     fn find_foreground_child_pid(root_pid: u32) -> Option<u32> {
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1977,74 +1993,51 @@ pub mod process_info {
 
             autorename_log(&format!("root={} snapshot_entries={}", root_pid, entries.len()));
 
-            // Log direct children of root_pid
-            let direct: Vec<_> = entries.iter()
-                .filter(|(_, ppid, _)| *ppid == root_pid)
+            // Immediate children of root_pid, skipping system processes.
+            let direct: Vec<(u32, String)> = entries.iter()
+                .filter(|(_, ppid, name)| *ppid == root_pid && !is_system_exe(name))
+                .map(|(pid, _, name)| (*pid, name.clone()))
                 .collect();
-            for (pid, _, name) in &direct {
+
+            for (pid, name) in &direct {
                 autorename_log(&format!("  direct_child: pid={} name={}", pid, name));
             }
 
-            // BFS: collect all descendants with their depth.
-            // Each entry is (pid, exe_name, depth).
-            let mut descendants: Vec<(u32, String, u32)> = Vec::new();
-            let mut queue: Vec<(u32, u32)> = vec![(root_pid, 0)]; // (pid, depth)
-            let mut head = 0;
-            while head < queue.len() {
-                let (parent, depth) = queue[head];
-                head += 1;
-                for (pid, ppid, name) in &entries {
-                    if *ppid == parent && *pid != root_pid
-                        && !descendants.iter().any(|(p, _, _)| p == pid)
-                    {
-                        descendants.push((*pid, name.clone(), depth + 1));
-                        queue.push((*pid, depth + 1));
-                    }
-                }
-            }
-
-            autorename_log(&format!("root={} descendants={}", root_pid, descendants.len()));
-            for (pid, name, depth) in &descendants {
-                autorename_log(&format!("  desc: pid={} name={} depth={}", pid, name, depth));
-            }
-
-            if descendants.is_empty() {
+            if direct.is_empty() {
+                autorename_log(&format!("root={} no_direct_children", root_pid));
                 return None;
             }
 
-            // A "leaf" is a descendant that has no children in our descendant set.
-            let desc_pids: std::collections::HashSet<u32> =
-                descendants.iter().map(|(p, _, _)| *p).collect();
-            let leaves: Vec<(u32, &str, u32)> = descendants.iter()
-                .filter(|(pid, _, _)| {
-                    // No entry in the process table has this pid as parent
-                    // while also being in our descendant set.
-                    !entries.iter().any(|(ep, eppid, _)| *eppid == *pid && desc_pids.contains(ep))
-                })
-                .map(|(pid, name, depth)| (*pid, name.as_str(), *depth))
-                .collect();
+            // Pick the immediate child.  When multiple exist, prefer the
+            // largest PID (most recently created).
+            let (mut chosen_pid, chosen_name) = direct.iter()
+                .max_by_key(|(pid, _)| *pid)
+                .map(|(pid, name)| (*pid, name.clone()))
+                .unwrap();
 
-            // Choose from leaves if available, otherwise from all descendants.
-            let pool: Vec<(u32, &str, u32)> = if !leaves.is_empty() {
-                leaves
-            } else {
-                descendants.iter().map(|(p, n, d)| (*p, n.as_str(), *d)).collect()
-            };
+            autorename_log(&format!("root={} immediate_child={} name={}", root_pid, chosen_pid, chosen_name));
 
-            // Prefer non-system candidates.
-            let user_pool: Vec<&(u32, &str, u32)> = pool.iter()
-                .filter(|(_, name, _)| !is_system_exe(name))
-                .collect();
+            // If the immediate child is a known wrapper (cmd, bash, npx, ...),
+            // look one level deeper for the real program.
+            if is_wrapper_exe(&chosen_name) {
+                let grandchildren: Vec<(u32, String)> = entries.iter()
+                    .filter(|(_, ppid, name)| *ppid == chosen_pid && !is_system_exe(name))
+                    .map(|(pid, _, name)| (*pid, name.clone()))
+                    .collect();
 
-            let selection = if !user_pool.is_empty() { user_pool } else { pool.iter().collect() };
+                if let Some((gc_pid, gc_name)) = grandchildren.iter()
+                    .max_by_key(|(pid, _)| *pid)
+                {
+                    autorename_log(&format!(
+                        "root={} wrapper={} skip_to_grandchild={} name={}",
+                        root_pid, chosen_name, gc_pid, gc_name
+                    ));
+                    chosen_pid = *gc_pid;
+                }
+            }
 
-            // Deepest first, then largest PID as tiebreaker.
-            let result = selection.iter()
-                .max_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)))
-                .map(|(pid, _, _)| *pid);
-
-            autorename_log(&format!("root={} selected={:?}", root_pid, result));
-            result
+            autorename_log(&format!("root={} selected={}", root_pid, chosen_pid));
+            Some(chosen_pid)
         }
     }
 

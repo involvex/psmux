@@ -1151,6 +1151,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             if let Some(p) = target_pane() {
                 if let Some(pid) = p.child_pid {
                     crate::platform::process_info::get_foreground_process_name(pid)
+                        .or_else(|| crate::platform::process_info::get_process_name(pid))
                         .unwrap_or_else(|| "shell".into())
                 } else if !p.title.is_empty() {
                     p.title.clone()
