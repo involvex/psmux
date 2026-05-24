@@ -310,6 +310,33 @@ In addition to the 83 standard tmux commands, psmux provides extra commands usef
 | `set-pane-title <title>` | Set pane title directly |
 | `toggle-sync` | Toggle synchronized input for all panes in a window |
 
+### Text-input route signal (`#{pane_last_text_input}`)
+
+A read-only format variable: **milliseconds since printable text last reached
+this pane via the interactive input route** (empty until the first one).
+
+```powershell
+psmux display-message -t dev -p '#{pane_last_text_input}'   # e.g. "740", or "" if none yet
+```
+
+It is a **route** signal, not human-presence detection. The contract:
+
+- **Interactive route** (`handle_key -> forward_key_to_active`) **updates** it.
+- **Injected route** (`send-keys` / `send-paste` / `send-text` ->
+  `send_text_to_active`) does **not** update it. App output never does either,
+  so it distinguishes interactive text from injected text — something
+  `capture-pane` can't.
+- **Key scope:** printable text counts; `Enter`, arrows/navigation, shortcuts
+  and any `Ctrl`/`Alt` chord do not.
+- **Caveat:** a bot that injects *real key events* through the interactive
+  route (not via `send-keys`) will also update it — this measures the route,
+  not who's behind it.
+
+Useful when a tool drives a pane programmatically and wants to yield the moment
+typing arrives on the interactive route. Consumers own all policy (e.g. treat
+"value < N ms" as "active"); psmux just exposes the timestamp, kept on the pane
+(no file, freed with the pane).
+
 ## Named Paste Buffers
 
 psmux supports named paste buffers for structured inter-pane data exchange:

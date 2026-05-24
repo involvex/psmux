@@ -1869,7 +1869,48 @@ pub fn encode_key_event(key: &KeyEvent) -> Option<Vec<u8>> {
     Some(encoded)
 }
 
+/// A printable text keystroke on the INTERACTIVE input route (drives
+/// `#{pane_last_text_input}`). Excludes control codes and any Ctrl/Alt-modified
+/// key, so navigation, shortcuts, Enter, Tab, etc. don't count. Shift is fine
+/// (capitals).
+pub(crate) fn is_text_input_key(key: &KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Char(c)
+            if !c.is_control()
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+    )
+}
+
 pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {
+    // Record use of the INTERACTIVE text-input route, exposed read-only as
+    // `#{pane_last_text_input}`. This route is handle_key -> forward_key_to_active;
+    // the injected route (send-keys / send-paste / send-text -> send_text_to_active)
+    // does NOT pass here, so it never updates the signal. Printable text only
+    // (no control / Ctrl / Alt). Stamp exactly the panes that will RECEIVE the
+    // key — every non-dead pane under sync-input, else the active pane if alive
+    // — so the timestamp matches what's actually routed.
+    if is_text_input_key(&key) {
+        let now = Instant::now();
+        let sync = app.sync_input;
+        let win = &mut app.windows[app.active_idx];
+        if sync {
+            fn mark(node: &mut Node, now: Instant) {
+                match node {
+                    Node::Leaf(p) if !p.dead => p.last_text_input = Some(now),
+                    Node::Leaf(_) => {}
+                    Node::Split { children, .. } => { for c in children { mark(c, now); } }
+                }
+            }
+            mark(&mut win.root, now);
+        } else if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+            if !p.dead {
+                p.last_text_input = Some(now);
+            }
+        }
+    }
+
     // On Windows, modified Enter delivery depends on the modifier:
     //
     // Shift/Alt+Enter (no Ctrl): Use VT encoding ONLY (\x1b\r).  Native
@@ -3325,3 +3366,7 @@ mod tests_issue226_ctrl_slash;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue284_pageup_wsl.rs"]
 mod tests_issue284_pageup_wsl;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_last_text_input.rs"]
+mod tests_pane_last_text_input;

@@ -106,6 +106,13 @@ pub struct Pane {
     pub last_infer_title: Instant,
     /// True when the child process has exited but remain-on-exit keeps the pane visible.
     pub dead: bool,
+    /// Timestamp of the last printable keystroke routed via the INTERACTIVE
+    /// text-input route (`handle_key -> forward_key_to_active`); `None` until
+    /// the first one. NOT updated by the injected route (`send-keys` /
+    /// `send-paste` / `send-text`). Exposed read-only as the
+    /// `#{pane_last_text_input}` format variable. Lives on the pane, so it's
+    /// freed with it (no separate lifecycle / file).
+    pub last_text_input: Option<Instant>,
     /// Cached VT bridge detection result (for mouse injection).
     /// Updated on first mouse event and refreshed every 2 seconds.
     pub vt_bridge_cache: Option<(Instant, bool)>,

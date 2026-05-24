@@ -263,6 +263,7 @@ pub fn create_proxy_pane(
         last_title_check: epoch,
         last_infer_title: epoch,
         dead: false,
+        last_text_input: None,
         vt_bridge_cache: None,
         vti_mode_cache: None,
         mouse_input_cache: None,
