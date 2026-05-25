@@ -475,9 +475,16 @@ fn run_main() -> io::Result<()> {
                                             let addr = format!("127.0.0.1:{}", port_str.trim());
                                             if let Ok(mut s) = std::net::TcpStream::connect_timeout(
                                                 &addr.parse().unwrap(),
-                                                Duration::from_millis(50)
+                                                Duration::from_millis(200)
                                             ) {
-                                                let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
+                                                // Format expansion for variables like
+                                                // pane_current_command/pane_current_path can
+                                                // take 40+ ms each (OS process queries), so
+                                                // 50 ms was too tight for multi-variable
+                                                // format strings (e.g. libtmux's 123-field
+                                                // format). 500 ms allows complex formats
+                                                // while still detecting dead sessions quickly.
+                                                let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
                                                 // Read session key and authenticate
                                                 let key_path = format!("{}\\.psmux\\{}.key", home, base);
                                                 if let Ok(key) = std::fs::read_to_string(&key_path) {
