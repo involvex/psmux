@@ -1384,8 +1384,9 @@ match cmd {
         }
     }
     "set-buffer" => {
-        // Parse -b name and content, skipping flags
+        // Parse -b name, -w (clipboard propagation), and content
         let mut buf_name: Option<String> = None;
+        let mut propagate_to_clipboard = false;
         let mut i = 0;
         let mut content_parts: Vec<&str> = Vec::new();
         while i < args.len() {
@@ -1394,6 +1395,9 @@ match cmd {
                     buf_name = Some(name.to_string());
                 }
                 i += 2; // skip -b and its value (buffer name)
+            } else if args[i] == "-w" {
+                propagate_to_clipboard = true;
+                i += 1;
             } else if args[i].starts_with('-') {
                 i += 1; // skip unknown flags
             } else {
@@ -1402,6 +1406,9 @@ match cmd {
             }
         }
         let content = content_parts.join(" ");
+        if propagate_to_clipboard {
+            crate::clipboard::copy_to_system_clipboard(&content);
+        }
         if let Some(name) = buf_name {
             let _ = tx.send(CtrlReq::SetNamedBuffer(name, content));
         } else {

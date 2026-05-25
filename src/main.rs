@@ -1691,6 +1691,7 @@ fn run_main() -> io::Result<()> {
             "set-buffer" | "setb" => {
                 let mut buffer_name: Option<String> = None;
                 let mut data: Option<String> = None;
+                let mut propagate_to_clipboard = false;
                 let mut i = 1;
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
@@ -1700,12 +1701,18 @@ fn run_main() -> io::Result<()> {
                                 i += 1;
                             }
                         }
+                        "-w" => { propagate_to_clipboard = true; }
                         s if !s.starts_with('-') => {
                             data = Some(s.to_string());
                         }
                         _ => {}
                     }
                     i += 1;
+                }
+                if propagate_to_clipboard {
+                    if let Some(ref d) = data {
+                        crate::clipboard::copy_to_system_clipboard(d);
+                    }
                 }
                 let mut cmd = "set-buffer".to_string();
                 if let Some(b) = buffer_name { cmd.push_str(&format!(" -b {}", b)); }
