@@ -179,11 +179,77 @@ pub fn parse_config_content(app: &mut AppState, content: &str) {
         lines.push(continuation);
     }
 
+    // Brace-block collection state for if-shell 'cond' { ... } syntax.
+    // When we encounter a line like `if-shell 'false' {`, we collect
+    // subsequent lines until the matching `}` and only execute them
+    // if the condition is true. Supports an optional else block:
+    //   if-shell 'cond' { ... } { ... }
+    use parse_config_content_types::BraceBlock;
+    let mut brace_block: Option<BraceBlock> = None;
+
     for line in &lines {
         let l = line.trim();
 
         // Skip empty lines and comments (but comments start with # not %)
-        if l.is_empty() { continue; }
+        if l.is_empty() {
+            // Still collect empty lines inside brace blocks to preserve structure
+            if let Some(ref mut bb) = brace_block {
+                if bb.in_else { bb.else_lines.push(String::new()); }
+                else { bb.true_lines.push(String::new()); }
+            }
+            continue;
+        }
+
+        // --- Brace-block collection ---
+        if brace_block.is_some() {
+            let bb = brace_block.as_mut().unwrap();
+            // Count braces to handle nesting
+            let opens = l.chars().filter(|&c| c == '{').count();
+            let closes = l.chars().filter(|&c| c == '}').count();
+
+            if l == "}" && bb.depth == 1 {
+                // Closing brace at top level
+                bb.depth = 0;
+                // Continue to see if next line opens an else `{`.
+                continue;
+            } else if bb.depth == 0 && !bb.in_else && l == "{" {
+                // Start of else block (on a separate line after closing `}`)
+                bb.in_else = true;
+                bb.depth = 1;
+                continue;
+            } else if bb.depth == 0 {
+                // We're past the block(s). Process the collected brace block
+                // and then fall through to process the current line normally.
+                let finished = brace_block.take().unwrap();
+                process_brace_if_shell(app, &finished);
+                // Fall through to process `l` as a normal line
+            } else {
+                // Inside a block at depth >= 1
+                bb.depth = bb.depth + opens - closes;
+                if bb.in_else {
+                    bb.else_lines.push(l.to_string());
+                } else {
+                    bb.true_lines.push(l.to_string());
+                }
+                continue;
+            }
+        }
+
+        // --- Check if this line starts an if-shell brace block ---
+        if (l.starts_with("if-shell ") || l.starts_with("if ")) && l.ends_with('{') {
+            // Check %if stack — only start brace block if active
+            let active = if_stack.last().map(|s| s.active).unwrap_or(true);
+            if active {
+                brace_block = Some(BraceBlock {
+                    if_line: l.to_string(),
+                    true_lines: Vec::new(),
+                    else_lines: Vec::new(),
+                    depth: 1,
+                    in_else: false,
+                });
+            }
+            continue;
+        }
 
         // Handle %-directives before checking for # comments
         if l.starts_with('%') {
@@ -268,6 +334,105 @@ pub fn parse_config_content(app: &mut AppState, content: &str) {
         };
 
         parse_config_line(app, &l);
+    }
+
+    // Process any remaining unclosed brace block at end of file
+    if let Some(finished) = brace_block.take() {
+        process_brace_if_shell(app, &finished);
+    }
+}
+
+/// Process a collected if-shell brace block by evaluating the condition
+/// and executing the appropriate branch.
+fn process_brace_if_shell(app: &mut AppState, bb: &parse_config_content_types::BraceBlock) {
+    // Extract the condition from the if-shell line (strip "if-shell " or "if " and trailing "{")
+    let line = bb.if_line.trim();
+    let rest = if line.starts_with("if-shell ") {
+        &line[9..]
+    } else if line.starts_with("if ") {
+        &line[3..]
+    } else {
+        return;
+    };
+    let rest = rest.trim().trim_end_matches('{').trim();
+
+    // Parse flags and extract condition
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    let mut format_mode = false;
+    let mut condition = String::new();
+    let mut i = 0;
+    while i < parts.len() {
+        match parts[i] {
+            "-b" => {}
+            "-F" => { format_mode = true; }
+            "-bF" | "-Fb" => { format_mode = true; }
+            "-t" => { i += 1; } // skip target
+            s => {
+                // Handle quoted string
+                if s.starts_with('"') || s.starts_with('\'') {
+                    let quote = s.chars().next().unwrap();
+                    if s.ends_with(quote) && s.len() > 1 {
+                        condition = s[1..s.len()-1].to_string();
+                    } else {
+                        let mut buf = s[1..].to_string();
+                        i += 1;
+                        while i < parts.len() {
+                            buf.push(' ');
+                            buf.push_str(parts[i]);
+                            if parts[i].ends_with(quote) {
+                                buf.truncate(buf.len() - 1);
+                                break;
+                            }
+                            i += 1;
+                        }
+                        condition = buf;
+                    }
+                } else {
+                    condition = s.to_string();
+                }
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    if condition.is_empty() { return; }
+
+    // Evaluate the condition
+    let success = if format_mode {
+        let expanded = crate::format::expand_format(&condition, app);
+        !expanded.is_empty() && expanded != "0"
+    } else if condition == "true" || condition == "1" {
+        true
+    } else if condition == "false" || condition == "0" {
+        false
+    } else {
+        let (shell_prog, shell_args) = crate::commands::resolve_run_shell();
+        let mut c = std::process::Command::new(&shell_prog);
+        for a in &shell_args { c.arg(a); }
+        c.arg(&condition);
+        { use crate::platform::HideWindowCommandExt; c.hide_window(); }
+        c.status().map(|s| s.success()).unwrap_or(false)
+    };
+
+    // Execute the appropriate branch
+    let lines = if success { &bb.true_lines } else { &bb.else_lines };
+    for line in lines {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') { continue; }
+        parse_config_line(app, l);
+    }
+}
+
+/// Types used internally by parse_config_content (declared in a module to
+/// allow process_brace_if_shell to reference BraceBlock by path).
+mod parse_config_content_types {
+    pub struct BraceBlock {
+        pub if_line: String,
+        pub true_lines: Vec<String>,
+        pub else_lines: Vec<String>,
+        pub depth: usize,
+        pub in_else: bool,
     }
 }
 

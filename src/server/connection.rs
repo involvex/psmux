@@ -1921,7 +1921,10 @@ match cmd {
                     let _ = tx.send(CtrlReq::ShowOptionValue(rtx, name.to_string()));
                 }
                 if let Ok(text) = rrx.recv() {
-                    let resolved = if text.is_empty() && window_scope && has_a {
+                    let resolved = if text.is_empty() && window_scope {
+                        // Fall back to global options when window-scope
+                        // lookup returns empty. Options like pane-base-index
+                        // may only exist at the global level in psmux.
                         let (frtx, frrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::ShowOptionValue(frtx, name.to_string()));
                         frrx.recv().unwrap_or_default()
