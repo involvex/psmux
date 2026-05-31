@@ -488,6 +488,47 @@ pub fn compute_active_rect_json(node: &LayoutJson, area: Rect) -> Option<Rect> {
     }
 }
 
+/// Compute the active pane rectangle, optionally treating the layout as zoomed.
+///
+/// When `zoomed` is true, this mirrors `render_layout_json` behavior by walking
+/// only the visible (non-zero) split child and passing down the full parent area.
+pub(crate) fn compute_active_rect_json_zoom_aware(
+    node: &LayoutJson,
+    area: Rect,
+    zoomed: bool,
+) -> Option<Rect> {
+    match node {
+        LayoutJson::Leaf { active, .. } => {
+            if *active { Some(area) } else { None }
+        }
+        LayoutJson::Split { kind, sizes, children } => {
+            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                sizes.clone()
+            } else {
+                vec![(100 / children.len().max(1)) as u16; children.len()]
+            };
+            if zoomed {
+                if let Some(i) = effective_sizes.iter().position(|&s| s != 0) {
+                    if let Some(child) = children.get(i) {
+                        return compute_active_rect_json_zoom_aware(child, area, zoomed);
+                    }
+                }
+                return None;
+            }
+            let is_horizontal = kind == "Horizontal";
+            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+            for (i, child) in children.iter().enumerate() {
+                if i < rects.len() {
+                    if let Some(r) = compute_active_rect_json_zoom_aware(child, rects[i], zoomed) {
+                        return Some(r);
+                    }
+                }
+            }
+            None
+        }
+    }
+}
+
 /// Render a large ASCII clock overlay (tmux clock-mode).
 /// Top-level so both the main viewport and the choose-tree/choose-session
 /// preview can share one implementation.
@@ -5510,37 +5551,6 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             }
             let effective = find_active_cursor_shape(&root)
                 .unwrap_or_else(|| state_cursor_style_code.unwrap_or_else(crate::rendering::configured_cursor_code));
-            // Compute the active pane's screen Rect so we can translate
-            // pane-local cursor coords to terminal-global coords.
-            fn find_active_rect(node: &LayoutJson, area: Rect, zoomed: bool) -> Option<Rect> {
-                match node {
-                    LayoutJson::Leaf { active, .. } => {
-                        if *active { Some(area) } else { None }
-                    }
-                    LayoutJson::Split { kind, sizes, children } => {
-                        let eff: Vec<u16> = if sizes.len() == children.len() {
-                            sizes.clone()
-                        } else {
-                            vec![(100 / children.len().max(1)) as u16; children.len()]
-                        };
-                        if zoomed {
-                            if let Some(i) = eff.iter().position(|&s| s != 0) {
-                                if let Some(child) = children.get(i) {
-                                    return find_active_rect(child, area, zoomed);
-                                }
-                            }
-                            return None;
-                        }
-                        let rects = crate::tree::split_with_gaps(kind == "Horizontal", &eff, area);
-                        for (i, child) in children.iter().enumerate() {
-                            if i < rects.len() {
-                                if let Some(r) = find_active_rect(child, rects[i], zoomed) { return Some(r); }
-                            }
-                        }
-                        None
-                    }
-                }
-            }
             let active_pane_area: Option<Rect> = {
                 let sz = terminal.size().unwrap_or_default();
                 let constraints = if status_at_top {
@@ -5551,7 +5561,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 let chunks = Layout::default().direction(Direction::Vertical)
                     .constraints(constraints).split(sz.into());
                 let content_chunk = if status_at_top { chunks[1] } else { chunks[0] };
-                find_active_rect(&root, content_chunk, client_zoomed)
+                compute_active_rect_json_zoom_aware(&root, content_chunk, client_zoomed)
             };
             // Compute screen-global cursor position from pane-local coords.
             let cursor_visible = if let (Some((cc, cr)), Some(inner)) = (post_draw_cursor, active_pane_area) {
@@ -5735,3 +5745,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests-rs/test_zoom_bleed.rs"]
 mod test_zoom_bleed;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_zoom_cursor_rect.rs"]
+mod test_zoom_cursor_rect;
