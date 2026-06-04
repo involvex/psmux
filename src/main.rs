@@ -456,6 +456,12 @@ fn run_main() -> io::Result<()> {
                                     i += 1;
                                 }
                             }
+                            s if s.starts_with('-') => {
+                                // Unknown flag: error like tmux rather than ignoring it,
+                                // so scripts (libtmux/tmuxp) see a nonzero exit.
+                                eprintln!("psmux: list-sessions: unknown option '{}'", s);
+                                std::process::exit(1);
+                            }
                             _ => {}
                         }
                         i += 1;
@@ -1914,12 +1920,20 @@ fn run_main() -> io::Result<()> {
                         }
                         "-x" => {
                             if let Some(v) = cmd_args.get(i + 1) {
+                                if v.trim_end_matches('%').parse::<i32>().is_err() {
+                                    eprintln!("psmux: resize-pane: -x value must be a number, got '{}'", v);
+                                    std::process::exit(1);
+                                }
                                 cmd.push_str(&format!(" -x {}", v));
                                 i += 1;
                             }
                         }
                         "-y" => {
                             if let Some(v) = cmd_args.get(i + 1) {
+                                if v.trim_end_matches('%').parse::<i32>().is_err() {
+                                    eprintln!("psmux: resize-pane: -y value must be a number, got '{}'", v);
+                                    std::process::exit(1);
+                                }
                                 cmd.push_str(&format!(" -y {}", v));
                                 i += 1;
                             }
@@ -2504,6 +2518,32 @@ fn run_main() -> io::Result<()> {
             }
             // set-option / set / set-window-option / setw - Set an option
             "set-option" | "set" | "set-window-option" | "setw" => {
+                // Validate that known integer-valued options receive a numeric value,
+                // erroring (nonzero exit) like tmux instead of silently accepting junk.
+                {
+                    const INT_OPTS: &[&str] = &[
+                        "history-limit", "escape-time", "display-time", "display-panes-time",
+                        "repeat-time", "message-limit", "status-interval", "base-index",
+                        "pane-base-index", "status-left-length", "status-right-length",
+                        "lock-after-time", "history-file-limit",
+                    ];
+                    // Collect positional (non-flag) args, skipping -t's value.
+                    let mut positionals: Vec<&str> = Vec::new();
+                    let mut j = 1;
+                    while j < cmd_args.len() {
+                        let a = cmd_args[j].as_str();
+                        if a == "-t" { j += 2; continue; }
+                        if a.starts_with('-') { j += 1; continue; }
+                        positionals.push(a);
+                        j += 1;
+                    }
+                    if let (Some(name), Some(val)) = (positionals.first(), positionals.get(1)) {
+                        if INT_OPTS.contains(name) && val.parse::<i64>().is_err() {
+                            eprintln!("psmux: set-option: value for '{}' must be a number, got '{}'", name, val);
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 let cmd_str: String = cmd_args.iter().map(|s| {
                     let s = s.as_str();
                     if s.contains(' ') {
