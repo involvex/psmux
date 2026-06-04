@@ -1,6 +1,18 @@
-use std::io::{self, Write};
+use std::io::{self, ErrorKind, Write};
+use std::path::Path;
 use std::time::Duration;
 use std::env;
+
+const STALE_PORT_PROBE_ATTEMPTS: usize = 3;
+const STALE_PORT_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
+const STALE_PORT_RETRY_DELAY: Duration = Duration::from_millis(25);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PortProbeResult {
+    Alive,
+    Stale,
+    Inconclusive,
+}
 
 /// Returns true if this port-file base name belongs to a warm (standby) server.
 /// Warm sessions should be hidden from user-facing lists and never auto-attached.
@@ -114,34 +126,68 @@ pub fn cleanup_stale_port_files() {
         Err(_) => return,
     };
     let psmux_dir = format!("{}\\.psmux", home);
-    if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
+    cleanup_stale_port_files_in(Path::new(&psmux_dir));
+}
+
+fn cleanup_stale_port_files_in(psmux_dir: &Path) {
+    cleanup_stale_port_files_in_with(psmux_dir, probe_port_for_cleanup);
+}
+
+fn cleanup_stale_port_files_in_with<F>(psmux_dir: &Path, mut probe: F)
+where
+    F: FnMut(u16) -> PortProbeResult,
+{
+    if let Ok(entries) = std::fs::read_dir(psmux_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().map(|e| e == "port").unwrap_or(false) {
                 if let Ok(port_str) = std::fs::read_to_string(&path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
-                        let addr = format!("127.0.0.1:{}", port);
-                        if std::net::TcpStream::connect_timeout(
-                            &addr.parse().unwrap(),
-                            Duration::from_millis(5)
-                        ).is_err() {
-                            let _ = std::fs::remove_file(&path);
-                            // Also remove the matching .key and .sid files
-                            let key_path = path.with_extension("key");
-                            let _ = std::fs::remove_file(&key_path);
-                            let sid_path = path.with_extension("sid");
-                            let _ = std::fs::remove_file(&sid_path);
+                        if probe(port) == PortProbeResult::Stale {
+                            remove_session_registry_files(&path);
                         }
                     } else {
-                        let _ = std::fs::remove_file(&path);
-                        let key_path = path.with_extension("key");
-                        let _ = std::fs::remove_file(&key_path);
-                        let sid_path = path.with_extension("sid");
-                        let _ = std::fs::remove_file(&sid_path);
+                        remove_session_registry_files(&path);
                     }
                 }
             }
         }
+    }
+}
+
+fn remove_session_registry_files(port_path: &Path) {
+    let _ = std::fs::remove_file(port_path);
+    let key_path = port_path.with_extension("key");
+    let _ = std::fs::remove_file(&key_path);
+    let sid_path = port_path.with_extension("sid");
+    let _ = std::fs::remove_file(&sid_path);
+}
+
+fn probe_port_for_cleanup(port: u16) -> PortProbeResult {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut saw_refused = false;
+    let mut saw_inconclusive = false;
+
+    for attempt in 0..STALE_PORT_PROBE_ATTEMPTS {
+        match std::net::TcpStream::connect_timeout(&addr, STALE_PORT_CONNECT_TIMEOUT) {
+            Ok(_) => return PortProbeResult::Alive,
+            Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                saw_refused = true;
+            }
+            Err(_) => {
+                saw_inconclusive = true;
+            }
+        }
+
+        if attempt + 1 < STALE_PORT_PROBE_ATTEMPTS {
+            std::thread::sleep(STALE_PORT_RETRY_DELAY);
+        }
+    }
+
+    if saw_refused && !saw_inconclusive {
+        PortProbeResult::Stale
+    } else {
+        PortProbeResult::Inconclusive
     }
 }
 

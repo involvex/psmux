@@ -7,11 +7,16 @@
 
 use super::*;
 
+use std::fs;
 use std::io::{Read, Write as IoWrite};
+use std::path::PathBuf;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
+
+static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Read the `AUTH <key>\n` + `session-info\n` lines the client sends so the
 /// fake server's subsequent writes land against the expected client state.
@@ -51,6 +56,30 @@ where
         let _ = done_tx.send(());
     });
     (addr, done_rx)
+}
+
+fn temp_psmux_dir(test_name: &str) -> PathBuf {
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir()
+        .join(format!("psmux_{test_name}_{}_{}", std::process::id(), n))
+        .join(".psmux");
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn write_registry_files(
+    dir: &std::path::Path,
+    session: &str,
+    port: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let port_path = dir.join(format!("{session}.port"));
+    let key_path = dir.join(format!("{session}.key"));
+    let sid_path = dir.join(format!("{session}.sid"));
+    fs::write(&port_path, port).unwrap();
+    fs::write(&key_path, "test-key").unwrap();
+    fs::write(&sid_path, "7").unwrap();
+    (port_path, key_path, sid_path)
 }
 
 #[test]
@@ -176,4 +205,60 @@ fn auth_rejected_returns_none() {
     // label rather than rendering the raw ERROR line as the session info.
     assert_eq!(info, None, "auth error leaked as session info: {:?}", info);
     let _ = done.recv_timeout(Duration::from_secs(2));
+}
+
+#[test]
+fn stale_cleanup_removes_invalid_port_and_key() {
+    let dir = temp_psmux_dir("stale_cleanup_invalid");
+    let (port_path, key_path, sid_path) = write_registry_files(&dir, "bad", "not-a-port");
+
+    cleanup_stale_port_files_in(&dir);
+
+    assert!(!port_path.exists(), "invalid .port file should be removed");
+    assert!(!key_path.exists(), "matching .key file should be removed");
+    assert!(!sid_path.exists(), "matching .sid file should be removed");
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[test]
+fn stale_cleanup_removes_registry_only_when_probe_confirms_stale() {
+    let dir = temp_psmux_dir("stale_cleanup_confirmed");
+    let (port_path, key_path, sid_path) = write_registry_files(&dir, "dead", "54321");
+
+    cleanup_stale_port_files_in_with(&dir, |_| PortProbeResult::Stale);
+
+    assert!(!port_path.exists(), "confirmed-stale .port file should be removed");
+    assert!(!key_path.exists(), "matching .key file should be removed");
+    assert!(!sid_path.exists(), "matching .sid file should be removed");
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[test]
+fn stale_cleanup_preserves_registry_when_probe_is_inconclusive() {
+    let dir = temp_psmux_dir("stale_cleanup_inconclusive");
+    let (port_path, key_path, sid_path) =
+        write_registry_files(&dir, "maybe-live", "54322");
+
+    cleanup_stale_port_files_in_with(&dir, |_| PortProbeResult::Inconclusive);
+
+    assert!(port_path.exists(), "inconclusive probe must not remove .port");
+    assert!(key_path.exists(), "inconclusive probe must not remove .key");
+    assert!(sid_path.exists(), "inconclusive probe must not remove .sid");
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+#[test]
+fn stale_cleanup_preserves_registry_for_live_listener() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind live listener");
+    let port = listener.local_addr().unwrap().port().to_string();
+    let dir = temp_psmux_dir("stale_cleanup_live");
+    let (port_path, key_path, sid_path) = write_registry_files(&dir, "live", &port);
+
+    cleanup_stale_port_files_in(&dir);
+
+    assert!(port_path.exists(), "live listener .port should be preserved");
+    assert!(key_path.exists(), "live listener .key should be preserved");
+    assert!(sid_path.exists(), "live listener .sid should be preserved");
+    drop(listener);
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
 }

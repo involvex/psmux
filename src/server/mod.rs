@@ -75,6 +75,40 @@ fn should_spawn_warm_server(app: &AppState) -> bool {
     app.warm_enabled && app.session_name != "__warm__" && !app.destroy_unattached
 }
 
+fn ensure_session_registry_files(home: &str, app: &AppState) {
+    let Some(port) = app.control_port else { return; };
+    let dir = format!("{}\\.psmux", home);
+    let _ = std::fs::create_dir_all(&dir);
+
+    let base = app.port_file_base();
+    let port_path = format!("{}\\{}.port", dir, base);
+    let key_path = format!("{}\\{}.key", dir, base);
+    let sid_path = format!("{}\\{}.sid", dir, base);
+    let port_value = port.to_string();
+    let sid_value = app.session_id.to_string();
+
+    if std::fs::read_to_string(&port_path)
+        .map(|s| s.trim() != port_value)
+        .unwrap_or(true)
+    {
+        let _ = std::fs::write(&port_path, &port_value);
+    }
+
+    if std::fs::read_to_string(&key_path)
+        .map(|s| s.trim() != app.session_key)
+        .unwrap_or(true)
+    {
+        let _ = std::fs::write(&key_path, &app.session_key);
+    }
+
+    if std::fs::read_to_string(&sid_path)
+        .map(|s| s.trim() != sid_value)
+        .unwrap_or(true)
+    {
+        let _ = std::fs::write(&sid_path, &sid_value);
+    }
+}
+
 /// Check if the active pane is currently squelched (hiding injected cd+cls).
 /// Uses the non-consuming `squelch_cleared()` so the layout serialiser can
 /// still properly consume the sentinel via `take_squelch_cleared()`.
@@ -483,12 +517,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
 
     app.session_key = session_key.clone();
 
+    ensure_session_registry_files(&home, &app);
     let regpath = format!("{}\\{}.port", dir, app.port_file_base());
-    let _ = std::fs::write(&regpath, port.to_string());
     let keypath = format!("{}\\{}.key", dir, app.port_file_base());
-    let _ = std::fs::write(&keypath, &session_key);
-    // Write session ID file so $N targets can resolve to this session
-    crate::session::write_session_id_file(&app.port_file_base(), app.session_id);
 
     // Expose the server identity via env var so that child processes spawned
     // by run-shell (from hooks, keybindings, etc.) can find this server when
@@ -717,6 +748,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Used to ramp down the server loop frequency when truly idle.
     let mut last_client_activity = Instant::now();
 
+    let mut last_registry_check = Instant::now();
+
     // Throttle reap_children: only check for exited processes every 250ms.
     // With hundreds of windows, calling try_wait() on every process each
     // loop iteration wastes CPU.  Exited processes are still reaped promptly
@@ -729,6 +762,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     let mut temp_focus_restore: Option<(usize, usize)> = None;
 
     loop {
+        if last_registry_check.elapsed() >= Duration::from_secs(5) {
+            last_registry_check = Instant::now();
+            ensure_session_registry_files(&home, &app);
+        }
+
         // Adaptive timeout: ramps from 1ms (active typing/echo) through
         // 5ms (client recently active) up to 50ms (fully idle).  This
         // dramatically reduces CPU usage when the session is idle while
