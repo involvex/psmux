@@ -73,6 +73,106 @@ struct PaneLeaf<'a> {
     rows_v2: &'a [RowRunsJson],
 }
 
+/// One OSC 8 hyperlink run to overlay after the frame is drawn (#361).
+/// `x`/`y` are 0-based absolute terminal coordinates; `text` is the exact
+/// glyphs ratatui already drew there; `style` is the run's style so the
+/// re-emitted glyphs look identical, just wrapped in OSC 8.
+#[derive(Clone)]
+pub(crate) struct HyperlinkRun {
+    pub x: u16,
+    pub y: u16,
+    pub text: String,
+    pub uri: String,
+    pub style: ratatui::style::Style,
+}
+
+thread_local! {
+    /// Hyperlink runs collected during the current frame's render, drained and
+    /// emitted after `terminal.draw()`. Thread-local because the client renders
+    /// on a single thread and this avoids threading a collector through the
+    /// recursive `render_layout_json`.
+    static FRAME_HYPERLINKS: std::cell::RefCell<Vec<HyperlinkRun>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn frame_hyperlinks_clear() {
+    FRAME_HYPERLINKS.with(|h| h.borrow_mut().clear());
+}
+
+pub(crate) fn frame_hyperlinks_push(run: HyperlinkRun) {
+    FRAME_HYPERLINKS.with(|h| h.borrow_mut().push(run));
+}
+
+pub(crate) fn frame_hyperlinks_take() -> Vec<HyperlinkRun> {
+    FRAME_HYPERLINKS.with(|h| std::mem::take(&mut *h.borrow_mut()))
+}
+
+/// SGR parameters for a ratatui color as a foreground (`base` 38/foreground)
+/// or background (`base` 48). Returns the numeric params without the leading
+/// `\x1b[` or trailing `m`.
+fn color_sgr(c: ratatui::style::Color, fg: bool) -> String {
+    use ratatui::style::Color::*;
+    // 30-37 / 40-47 normal, 90-97 / 100-107 bright, 39/49 default.
+    let (base, bright_base, def) = if fg { (30u8, 90u8, 39u8) } else { (40u8, 100u8, 49u8) };
+    match c {
+        Reset => def.to_string(),
+        Black => (base).to_string(),
+        Red => (base + 1).to_string(),
+        Green => (base + 2).to_string(),
+        Yellow => (base + 3).to_string(),
+        Blue => (base + 4).to_string(),
+        Magenta => (base + 5).to_string(),
+        Cyan => (base + 6).to_string(),
+        Gray => (base + 7).to_string(),
+        DarkGray => (bright_base).to_string(),
+        LightRed => (bright_base + 1).to_string(),
+        LightGreen => (bright_base + 2).to_string(),
+        LightYellow => (bright_base + 3).to_string(),
+        LightBlue => (bright_base + 4).to_string(),
+        LightMagenta => (bright_base + 5).to_string(),
+        LightCyan => (bright_base + 6).to_string(),
+        White => (bright_base + 7).to_string(),
+        Indexed(n) => format!("{};5;{}", if fg { 38 } else { 48 }, n),
+        Rgb(r, g, b) => format!("{};2;{};{};{}", if fg { 38 } else { 48 }, r, g, b),
+    }
+}
+
+/// Build the raw escape sequence that overlays the collected hyperlink runs on
+/// top of an already-drawn frame: save cursor, then for each run move to its
+/// position, set its style, write the text wrapped in OSC 8, and finally
+/// restore the cursor. Pure function so it can be unit-tested.
+pub(crate) fn build_osc8_overlay(runs: &[HyperlinkRun]) -> String {
+    use ratatui::style::Modifier;
+    if runs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("\x1b7"); // DECSC: save cursor
+    for run in runs {
+        if run.text.is_empty() {
+            continue;
+        }
+        // Move to 1-based (row;col), reset, then set the run's style.
+        out.push_str(&format!("\x1b[{};{}H\x1b[0m", run.y + 1, run.x + 1));
+        let mut params = vec![color_sgr(run.style.fg.unwrap_or(ratatui::style::Color::Reset), true),
+                              color_sgr(run.style.bg.unwrap_or(ratatui::style::Color::Reset), false)];
+        let m = run.style.add_modifier;
+        if m.contains(Modifier::BOLD) { params.push("1".into()); }
+        if m.contains(Modifier::DIM) { params.push("2".into()); }
+        if m.contains(Modifier::ITALIC) { params.push("3".into()); }
+        if m.contains(Modifier::UNDERLINED) { params.push("4".into()); }
+        if m.contains(Modifier::SLOW_BLINK) { params.push("5".into()); }
+        if m.contains(Modifier::REVERSED) { params.push("7".into()); }
+        if m.contains(Modifier::CROSSED_OUT) { params.push("9".into()); }
+        out.push_str(&format!("\x1b[{}m", params.join(";")));
+        // OSC 8 open ; text ; OSC 8 close.
+        out.push_str(&format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", run.uri, run.text));
+    }
+    out.push_str("\x1b[0m"); // reset SGR
+    out.push_str("\x1b8"); // DECRC: restore cursor
+    out
+}
+
 fn collect_leaves<'a>(node: &'a LayoutJson, area: Rect, out: &mut Vec<PaneLeaf<'a>>) {
     match node {
         LayoutJson::Leaf { rows_v2, .. } => {
@@ -767,10 +867,22 @@ pub fn render_layout_json(
                                 truncated.push(ch);
                             }
                             if !truncated.is_empty() {
+                                if let Some(uri) = &run.link {
+                                    frame_hyperlinks_push(HyperlinkRun {
+                                        x: inner.x + c, y: inner.y + r,
+                                        text: truncated.clone(), uri: uri.clone(), style,
+                                    });
+                                }
                                 spans.push(Span::styled(truncated, style));
                             }
                             c = inner.width;
                         } else {
+                            if let Some(uri) = &run.link {
+                                frame_hyperlinks_push(HyperlinkRun {
+                                    x: inner.x + c, y: inner.y + r,
+                                    text: text.to_string(), uri: uri.clone(), style,
+                                });
+                            }
                             spans.push(Span::styled(text, style));
                             c = c.saturating_add(run_w);
                         }
@@ -4329,6 +4441,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             let sz = terminal.size().unwrap_or_default();
             client_log("draw", &format!("pre-draw terminal_size={}x{}", sz.width, sz.height));
         }
+        // Reset OSC 8 hyperlink runs collected during this frame's render (#361).
+        frame_hyperlinks_clear();
         terminal.draw(|f| {
             let area = f.area();
             let constraints = if status_at_top {
@@ -5482,6 +5596,21 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             ));
         }
 
+        // ── Post-draw: overlay OSC 8 hyperlinks (#361) ───────────────
+        // ratatui's Buffer/Cell can't carry OSC 8, so after the frame is
+        // drawn we re-emit just the hyperlinked runs wrapped in OSC 8 at
+        // their screen positions, with cursor save/restore. This is a no-op
+        // for the common case (no links), so it does not touch the hot path.
+        {
+            let runs = frame_hyperlinks_take();
+            if !runs.is_empty() {
+                let overlay = build_osc8_overlay(&runs);
+                let mut out = std::io::stdout().lock();
+                let _ = std::io::Write::write_all(&mut out, overlay.as_bytes());
+                let _ = std::io::Write::flush(&mut out);
+            }
+        }
+
         // ── Post-draw: emit buffered OSC 52 clipboard ────────────────
         // Written AFTER terminal.draw() so it doesn't interfere with
         // ratatui's VT output buffer.
@@ -5771,3 +5900,7 @@ mod test_zoom_cursor_rect;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue345_command_prompt_utf8.rs"]
 mod test_issue345_command_prompt_utf8;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue361_osc8_overlay.rs"]
+mod test_issue361_osc8_overlay;

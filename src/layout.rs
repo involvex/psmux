@@ -29,12 +29,14 @@ pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Ve
         let mut prev_fg_raw: Option<vt100::Color> = None;
         let mut prev_bg_raw: Option<vt100::Color> = None;
         let mut prev_flags: u8 = 0;
+        let mut prev_link: Option<u32> = None;
         while c < cols {
-            let (width, cell_fg_raw, cell_bg_raw, flags) = if let Some(cell) = screen.cell(r, c) {
+            let (width, cell_fg_raw, cell_bg_raw, flags, cell_link) = if let Some(cell) = screen.cell(r, c) {
                 let t = cell.contents();
                 let t = if t.is_empty() { " " } else { t };
                 let cell_fg = cell.fgcolor();
                 let cell_bg = cell.bgcolor();
+                let cell_link = cell.hyperlink_id();
                 let mut w = UnicodeWidthStr::width(t) as u16;
                 if w == 0 { w = 1; }
                 let mut fl = 0u8;
@@ -47,8 +49,12 @@ pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Ve
                 if cell.hidden() { fl |= FLAG_HIDDEN; }
                 if cell.strikethrough() { fl |= FLAG_STRIKETHROUGH; }
 
+                // A hyperlink change must also break the run so the client can
+                // wrap exactly the linked text in OSC 8 (#361).
                 let merged = if let Some(last) = runs.last_mut() {
-                    if prev_fg_raw == Some(cell_fg) && prev_bg_raw == Some(cell_bg) && prev_flags == fl {
+                    if prev_fg_raw == Some(cell_fg) && prev_bg_raw == Some(cell_bg)
+                        && prev_flags == fl && prev_link == Some(cell_link)
+                    {
                         last.text.push_str(t);
                         last.width = last.width.saturating_add(w);
                         true
@@ -57,26 +63,32 @@ pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Ve
                 if !merged {
                     let fg = crate::util::color_to_name(cell_fg);
                     let bg = crate::util::color_to_name(cell_bg);
-                    runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w });
+                    let link = if cell_link != 0 {
+                        screen.hyperlink_uri(cell_link).map(|s| s.to_string())
+                    } else { None };
+                    runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w, link });
                 }
 
-                (w, cell_fg, cell_bg, fl)
+                (w, cell_fg, cell_bg, fl, cell_link)
             } else {
                 let merged = if let Some(last) = runs.last_mut() {
-                    if prev_fg_raw == Some(vt100::Color::Default) && prev_bg_raw == Some(vt100::Color::Default) && prev_flags == 0 {
+                    if prev_fg_raw == Some(vt100::Color::Default) && prev_bg_raw == Some(vt100::Color::Default)
+                        && prev_flags == 0 && prev_link == Some(0)
+                    {
                         last.text.push(' ');
                         last.width = last.width.saturating_add(1);
                         true
                     } else { false }
                 } else { false };
                 if !merged {
-                    runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1 });
+                    runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1, link: None });
                 }
-                (1u16, vt100::Color::Default, vt100::Color::Default, 0u8)
+                (1u16, vt100::Color::Default, vt100::Color::Default, 0u8, 0u32)
             };
             prev_fg_raw = Some(cell_fg_raw);
             prev_bg_raw = Some(cell_bg_raw);
             prev_flags = flags;
+            prev_link = Some(cell_link);
             c = c.saturating_add(width.max(1));
         }
         result.push(RowRunsJson { runs });
@@ -108,6 +120,11 @@ pub struct CellRunJson {
     pub bg: String,
     pub flags: u8,
     pub width: u16,
+    /// OSC 8 hyperlink URI for this run, if any (#361). Omitted from the JSON
+    /// when absent — links are rare, so the per-frame payload is unchanged for
+    /// normal output. The client re-emits OSC 8 around runs that carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -295,16 +312,18 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                     let mut prev_fg_raw: Option<vt100::Color> = None;
                     let mut prev_bg_raw: Option<vt100::Color> = None;
                     let mut prev_flags: u8 = 0;
+                    let mut prev_link: Option<u32> = None;
                     while c < p.last_cols {
                         // Process each cell inline to avoid per-cell String allocation.
                         // The &str from cell.contents() can only be used inside the
                         // if-let block (borrows from parser), so run-merging happens
                         // here too — push_str(&str) avoids allocation for merged cells.
-                        let (width, cell_fg_raw, cell_bg_raw, flags) = if let Some(cell) = screen.cell(r, c) {
+                        let (width, cell_fg_raw, cell_bg_raw, flags, cell_link) = if let Some(cell) = screen.cell(r, c) {
                             let t = cell.contents();
                             let t = if t.is_empty() { " " } else { t };
                             let cell_fg = cell.fgcolor();
                             let cell_bg = cell.bgcolor();
+                            let cell_link = cell.hyperlink_id();
                             let mut w = UnicodeWidthStr::width(t) as u16;
                             if w == 0 { w = 1; }
                             let mut fl = 0u8;
@@ -317,9 +336,13 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                             if cell.hidden() { fl |= FLAG_HIDDEN; }
                             if cell.strikethrough() { fl |= FLAG_STRIKETHROUGH; }
 
-                            // Run merging — push &str directly, no String allocation
+                            // Run merging — push &str directly, no String allocation.
+                            // Break on hyperlink change so OSC 8 wraps exactly the
+                            // linked text (#361).
                             let merged = if let Some(last) = runs.last_mut() {
-                                if prev_fg_raw == Some(cell_fg) && prev_bg_raw == Some(cell_bg) && prev_flags == fl {
+                                if prev_fg_raw == Some(cell_fg) && prev_bg_raw == Some(cell_bg)
+                                    && prev_flags == fl && prev_link == Some(cell_link)
+                                {
                                     last.text.push_str(t);
                                     last.width = last.width.saturating_add(w);
                                     true
@@ -328,7 +351,10 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                             if !merged {
                                 let fg = crate::util::color_to_name(cell_fg);
                                 let bg = crate::util::color_to_name(cell_bg);
-                                runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w });
+                                let link = if cell_link != 0 {
+                                    screen.hyperlink_uri(cell_link).map(|s| s.to_string())
+                                } else { None };
+                                runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w, link });
                             }
 
                             if need_full_content {
@@ -350,18 +376,20 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                                 }
                             }
 
-                            (w, cell_fg, cell_bg, fl)
+                            (w, cell_fg, cell_bg, fl, cell_link)
                         } else {
                             // No cell — default space
                             let merged = if let Some(last) = runs.last_mut() {
-                                if prev_fg_raw == Some(vt100::Color::Default) && prev_bg_raw == Some(vt100::Color::Default) && prev_flags == 0 {
+                                if prev_fg_raw == Some(vt100::Color::Default) && prev_bg_raw == Some(vt100::Color::Default)
+                                    && prev_flags == 0 && prev_link == Some(0)
+                                {
                                     last.text.push(' ');
                                     last.width = last.width.saturating_add(1);
                                     true
                                 } else { false }
                             } else { false };
                             if !merged {
-                                runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1 });
+                                runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1, link: None });
                             }
                             if need_full_content {
                                 row.push(CellJson {
@@ -370,11 +398,12 @@ fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) ->
                                     blink: false, hidden: false, strikethrough: false,
                                 });
                             }
-                            (1u16, vt100::Color::Default, vt100::Color::Default, 0u8)
+                            (1u16, vt100::Color::Default, vt100::Color::Default, 0u8, 0u32)
                         };
                         prev_fg_raw = Some(cell_fg_raw);
                         prev_bg_raw = Some(cell_bg_raw);
                         prev_flags = flags;
+                        prev_link = Some(cell_link);
                         c = c.saturating_add(width.max(1));
                     }
                     if need_full_content {
@@ -1255,3 +1284,7 @@ fn parse_layout_children(s: &str, closing: char) -> Option<(Vec<LayoutNode>, usi
 #[cfg(test)]
 #[path = "../tests-rs/test_layout.rs"]
 mod test_layout;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue361_serialize_hyperlink.rs"]
+mod test_issue361_serialize_hyperlink;

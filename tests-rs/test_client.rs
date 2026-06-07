@@ -190,6 +190,7 @@ fn make_run(text: &str, width: u16) -> crate::layout::CellRunJson {
         bg: String::new(),
         flags: 0,
         width,
+        link: None,
     }
 }
 
