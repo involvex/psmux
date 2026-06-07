@@ -226,6 +226,31 @@ pub(crate) fn pane_wants_mouse(pane: &Pane) -> bool {
     is_fullscreen_tui(pane)
 }
 
+/// Stricter than `pane_wants_mouse`, used ONLY for the scroll-wheel decision.
+///
+/// The wheel must auto-enter copy mode for an ordinary shell pane (tmux parity,
+/// issue #360).  `pane_wants_mouse`'s tier-3 `is_fullscreen_tui` content
+/// heuristic returns true for a normal shell that has filled the screen with
+/// the prompt sitting at the bottom, which wrongly forwarded the wheel to the
+/// shell (it ignores SGR wheel) instead of entering copy mode.  For scroll we
+/// only forward when the child RELIABLY wants the mouse: it enabled a mouse
+/// protocol (e.g. nvim `set mouse=a`) or is on the alternate screen.  TUI apps
+/// that genuinely consume the wheel satisfy one of these even on older ConPTY
+/// (the mouse protocol DECSETs are not stripped); apps that satisfy neither do
+/// not interpret the wheel anyway, so copy-mode scrollback is the right thing.
+pub(crate) fn pane_wants_scroll_forward(pane: &Pane) -> bool {
+    if let Ok(parser) = pane.term.lock() {
+        let screen = parser.screen();
+        if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
+            return true;
+        }
+        if screen.alternate_screen() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Strict check for hover/motion events.  Returns true only when the child
 /// has EXPLICITLY enabled mouse motion tracking (DECSET 1002 ButtonMotion or
 /// DECSET 1003 AnyMotion).
@@ -981,9 +1006,13 @@ pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool) {
         }
     }
 
-    // Check if target pane is a TUI app (uses same heuristic as pane_wants_mouse, fixes #285)
+    // Use the stricter scroll-forward check (mouse protocol or alternate
+    // screen only).  The permissive pane_wants_mouse() heuristic misclassifies
+    // a normal shell that has filled the screen (prompt at the bottom) as a TUI
+    // app, so the wheel was forwarded to the shell instead of entering copy
+    // mode (#360).
     let alt = active_pane(&win.root, &win.active_path)
-        .map_or(false, |p| pane_wants_mouse(p));
+        .map_or(false, |p| pane_wants_scroll_forward(p));
 
     if alt {
         // Forward scroll to TUI app
