@@ -728,7 +728,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
 
     // Create initial window — if a warm pane was pre-spawned above,
     // create_window's fast path transplants it instantly.
-    let saved_dir = if start_dir.is_some() { env::current_dir().ok() } else { None };
+    //
+    // Set the server's working directory to the session start directory (the
+    // -c dir if given, otherwise the launch dir) and DO NOT restore it
+    // afterwards. This server process hosts exactly one session, so its cwd is
+    // that session's start directory for the rest of its life. Every later
+    // new-window / split / warm-pane replenish without an explicit -c then
+    // inherits it — which is what makes an attached client's new-window/split
+    // open in the session start directory, while preserving the warm-pane fast
+    // path (warm panes are replenished in this same directory).
     if let Some(ref dir) = start_dir { env::set_current_dir(dir).ok(); }
     let create_result = if let Some(ref raw_args) = raw_command {
         create_window_raw(&*pty_system, &mut app, raw_args)
@@ -752,7 +760,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         if let Some(mut wp) = app.warm_pane.take() { wp.child.kill().ok(); }
         return Err(e);
     }
-    if let Some(prev) = saved_dir { env::set_current_dir(prev).ok(); }
     // Resize panes now that the initial window exists and config is loaded.
     // pane-border-status needs 1 row per pane for the border label (#288).
     resize_all_panes(&mut app);
