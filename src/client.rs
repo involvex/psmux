@@ -4174,6 +4174,24 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             }
         }
 
+        // Timer-driven repeat-window expiry (issue #371).
+        // A repeatable (-r) prefix binding arms `prefix_repeating` but does NOT
+        // send `prefix-end` — it stays armed so a follow-up repeat key is caught.
+        // The key-event path (above) only expires this on the NEXT keystroke, so
+        // with no further key the prefix-active state (and #{client_prefix}) would
+        // stay stuck on indefinitely. This runs every poll tick, so once
+        // repeat-time elapses with no repeat key we disarm and emit prefix-end,
+        // matching tmux where the indicator clears when the repeat window closes.
+        if prefix_armed && prefix_repeating
+            && prefix_armed_at.elapsed().as_millis() >= repeat_time_ms as u128
+        {
+            prefix_armed = false;
+            prefix_repeating = false;
+            #[cfg(windows)]
+            if ime_was_open { crate::platform::ime_restore(); ime_was_open = false; }
+            cmd_batch.push("prefix-end\n".into());
+        }
+
         // Send all batched commands immediately — keys reach the server
         // without waiting for a dump-state round-trip
         let sent_keys_this_iter = !cmd_batch.is_empty();
