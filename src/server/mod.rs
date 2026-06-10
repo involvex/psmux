@@ -520,6 +520,72 @@ pub(crate) fn write_startup_error_log(err: &dyn std::fmt::Display) {
     let _ = std::fs::write(&path, body);
 }
 
+/// Absolute path to `~/.psmux/server-startup.log`, or None if no home dir.
+pub(crate) fn startup_error_log_path() -> Option<String> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    if home.is_empty() {
+        return None;
+    }
+    Some(format!("{}\\.psmux\\server-startup.log", home))
+}
+
+/// Read the real failure reason out of a *fresh* `server-startup.log`.
+///
+/// Issue #370: when the initial pane spawn fails (e.g. a `default-shell`
+/// pointing at a non-existent path), the detached server records the concrete
+/// error here and exits, but the client the user is actually looking at only
+/// printed a generic "failed to create session". This lets the client echo the
+/// real cause to the terminal instead of leaving it buried in a log file.
+///
+/// `since_epoch` is the wall-clock second the current startup attempt began;
+/// logs whose `when (epoch s)` predate it are stale (from an earlier run or an
+/// adopted warm server) and are ignored. Returns `(error_text, log_path)`.
+pub(crate) fn read_fresh_startup_error(since_epoch: u64) -> Option<(String, String)> {
+    let path = startup_error_log_path()?;
+    read_fresh_startup_error_at(&path, since_epoch)
+}
+
+/// Path-injectable core of [`read_fresh_startup_error`] — kept separate so unit
+/// tests can exercise the freshness/parsing logic against a temp file without
+/// mutating the process-global USERPROFILE/HOME env (which would race the
+/// issue-167 log tests sharing this binary).
+fn read_fresh_startup_error_at(path: &str, since_epoch: u64) -> Option<(String, String)> {
+    let content = std::fs::read_to_string(path).ok()?;
+
+    // Freshness gate: only surface a log written during this attempt.
+    let when = content
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("when (epoch s):"))
+        .and_then(|v| v.trim().parse::<u64>().ok())?;
+    // Allow 2s of slack so clock granularity / pre-spawn timing never hides a
+    // genuinely-current failure.
+    if when + 2 < since_epoch {
+        return None;
+    }
+
+    // Extract the indented error block: the lines after the "error:" marker up
+    // to the next blank line.
+    let mut lines = content.lines();
+    let mut err_lines: Vec<String> = Vec::new();
+    while let Some(l) = lines.next() {
+        if l.trim() == "error:" {
+            for body_line in lines.by_ref() {
+                if body_line.trim().is_empty() {
+                    break;
+                }
+                err_lines.push(body_line.trim().to_string());
+            }
+            break;
+        }
+    }
+    if err_lines.is_empty() {
+        return None;
+    }
+    Some((err_lines.join(" "), path.to_string()))
+}
+
 pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>, group_target: Option<String>, env_vars: Vec<(String, String)>) -> io::Result<()> {
     // Write crash info to a log file when stderr is unavailable (detached server)
     // and clean up port/key files so stale entries do not linger (issue #204).
@@ -5061,3 +5127,7 @@ mod test_new_session_env;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue167_startup_log.rs"]
 mod test_issue167_startup_log;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue370_startup_error_passthrough.rs"]
+mod test_issue370_startup_error_passthrough;

@@ -1181,6 +1181,12 @@ fn run_main() -> io::Result<()> {
                 //     case window-creation latency under heavy concurrent load
                 //     (~9s), so it does not reintroduce false failures.
                 env::set_var("PSMUX_TARGET_SESSION", &port_file_base);
+                // Wall-clock second this attempt began — used to tell a fresh
+                // server-startup.log (this failure) from a stale one (issue #370).
+                let attempt_start_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 let ready_deadline = std::time::Instant::now() + Duration::from_secs(15);
                 let mut port_seen = false;
                 let mut ready = false;
@@ -1224,6 +1230,17 @@ fn run_main() -> io::Result<()> {
                 }
                 if !ready {
                     eprintln!("psmux: failed to create session '{}'", name);
+                    // Issue #370: surface the real reason instead of leaving it
+                    // buried in ~/.psmux/server-startup.log. The detached server
+                    // records the concrete spawn failure (e.g. a bad
+                    // default-shell path) there before exiting; echo it so the
+                    // user isn't left guessing why their config "silently" failed.
+                    if let Some((reason, log_path)) =
+                        crate::server::read_fresh_startup_error(attempt_start_epoch)
+                    {
+                        eprintln!("psmux: {}", reason);
+                        eprintln!("psmux: full startup diagnostics in {}", log_path);
+                    }
                     std::process::exit(1);
                 }
 
